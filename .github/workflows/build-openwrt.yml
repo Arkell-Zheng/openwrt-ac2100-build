@@ -1,7 +1,8 @@
 #
 # ImmortalWrt 云编译 workflow —— 小米/红米 AC2100 (MT7621)
-# 包含 passwall2 + OpenClash (mihomo 内核)，轻量配置
-# Fork 修订：增加 Release 永久发布、去掉自动删除运行记录、显式写权限
+# 集成 PassWall2 + OpenClash + sing-box / xray-core
+# 修订 v2: 加入官方 PassWall2 feed（旧 xiaorouji 源已 404），
+#          强制注入 passwall2 配置项，并在编译前后双重校验插件确实被打进固件
 #
 name: Build OpenWrt for AC2100
 
@@ -72,13 +73,19 @@ jobs:
           echo "===== 最近提交 ====="
           git log -1 --format='%H %s (%ci)'
 
-      - name: 更新 feeds (DIY part1 - 添加第三方 feed)
+      - name: 更新 feeds (DIY part1 + PassWall2 官方源)
         run: |
           cd openwrt
           chmod +x $GITHUB_WORKSPACE/$DIY_SH_PART1
           bash $GITHUB_WORKSPACE/$DIY_SH_PART1
+          echo 'src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main' >> feeds.conf.default
+          echo 'src-git passwall2 https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main' >> feeds.conf.default
+          echo "===== feeds.conf.default ====="
+          cat feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          echo "===== 校验 PassWall2 包已安装进 feeds ====="
+          ls -d package/feeds/passwall2/luci-app-passwall2 || { echo "ERROR: passwall2 feed 未安装"; exit 1; }
 
       - name: 加载自定义配置 (DIY part2 - 修改默认设置)
         run: |
@@ -86,11 +93,24 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/$DIY_SH_PART2
           bash $GITHUB_WORKSPACE/$DIY_SH_PART2
 
-      - name: 生成 .config
+      - name: 生成 .config 并校验 PassWall2
         run: |
           cd openwrt
           cp -f $GITHUB_WORKSPACE/$CONFIG_FILE .config
+          sed -i '/passwall2/d' .config
+          echo 'CONFIG_PACKAGE_luci-app-passwall2=y' >> .config
+          echo 'CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn=y' >> .config
+          echo 'CONFIG_PACKAGE_luci-app-passwall2_Nftables_Transparent_Proxy=y' >> .config
+          echo 'CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_Xray=y' >> .config
           make defconfig
+          echo "===== PassWall2 配置校验 ====="
+          grep -E 'passwall2' .config || true
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-passwall2=y' .config; then
+            echo "ERROR: luci-app-passwall2 未被选中（feed 缺失或依赖不满足）"
+            echo "--- feeds 中相关包 ---"
+            ./scripts/feeds list 2>/dev/null | grep -iE 'passwall|lyaml|geoview|chinadns|resolveip|libuci-lua|tcping' || true
+            exit 1
+          fi
           echo "===== 最终 .config 摘要 ====="
           grep -E '^(CONFIG_TARGET|CONFIG_PACKAGE_luci-app)' .config | head -60
 
@@ -124,6 +144,8 @@ jobs:
         if: env.UPLOAD_FIRMWARE == 'true'
         run: |
           cd openwrt
+          echo "===== 编译后强制校验：PassWall2 确实进入固件 ====="
+          grep -E '^luci-.*passwall2 ' bin/targets/ramips/mt7621/*.manifest || { echo "ERROR: manifest 中没有 luci-app-passwall2 / 中文语言包"; exit 1; }
           mkdir -p /tmp/firmware
           find bin/targets/ramips/mt7621/ -type f \( -name '*sysupgrade.bin' -o -name '*factory.bin' -o -name '*kernel1.bin' -o -name '*rootfs0.bin' -o -name 'sha256sums' -o -name '*.manifest' \) -exec cp -f {} /tmp/firmware/ \; 2>/dev/null || true
           find bin/packages/mipsel_24kc/base/ -type f -name '*.ipk' \( -name '*passwall*' -o -name '*openclash*' -o -name '*mihomo*' -o -name '*xray*' -o -name '*sing-box*' -o -name '*v2ray*' -o -name '*trojan*' -o -name '*shadowsocks*' \) -exec cp -f {} /tmp/firmware/ \; 2>/dev/null || true
@@ -149,7 +171,7 @@ jobs:
         if: steps.organize.outputs.status == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-ac2100-${{ github.run_number }}
+          name: immortalwrt-ac2100-passwall2-${{ github.run_number }}
           path: firmware/*
           retention-days: 30
           compression-level: 0
@@ -158,13 +180,14 @@ jobs:
         if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ac2100-${{ github.run_number }}
-          name: ImmortalWrt AC2100 #${{ github.run_number }}
+          tag_name: ac2100-passwall2-${{ github.run_number }}
+          name: ImmortalWrt AC2100 with PassWall2 #${{ github.run_number }}
           body: |
             ImmortalWrt 24.10 / ramips mt7621 / 小米 红米 AC2100
-            集成 passwall2 + OpenClash (mihomo)
-            sysupgrade.bin 用于从 OpenWrt 升级，factory.bin 用于从官方固件刷入
-            刷机有变砖风险，请先备份原固件
+            内置 luci-app-passwall2 + 中文语言包 + OpenClash
+            依赖核心：xray-core / sing-box / chinadns-ng / geoview / tcping
+            sysupgrade.bin 用于从 OpenWrt 升级；从官方固件刷入请先刷 Breed
+            刷机有变砖风险，请先备份原固件与 EEPROM
           files: firmware/*
 
       - name: 总是上传编译日志
