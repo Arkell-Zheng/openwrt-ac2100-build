@@ -1,6 +1,7 @@
 #
 # ImmortalWrt 云编译 workflow —— 小米/红米 AC2100 (MT7621)
 # 包含 passwall2 + OpenClash (mihomo 内核)，轻量配置
+# Fork 修订：增加 Release 永久发布、去掉自动删除运行记录、显式写权限
 #
 name: Build OpenWrt for AC2100
 
@@ -11,13 +12,10 @@ on:
         description: 'SSH 进 Actions 调试 (true/false)'
         required: false
         default: 'false'
-  push:
-    branches:
-      - main
-      - master
-  schedule:
-    # 每月 1 号和 15 号 UTC 18:00 (北京时间次日 02:00) 自动编译一次
-    - cron: '0 18 1,15 * *'
+
+permissions:
+  contents: write
+  actions: write
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
@@ -77,7 +75,6 @@ jobs:
       - name: 更新 feeds (DIY part1 - 添加第三方 feed)
         run: |
           cd openwrt
-          # 执行 DIY part1：添加 OpenClash 等第三方 feed
           chmod +x $GITHUB_WORKSPACE/$DIY_SH_PART1
           bash $GITHUB_WORKSPACE/$DIY_SH_PART1
           ./scripts/feeds update -a
@@ -92,11 +89,10 @@ jobs:
       - name: 生成 .config
         run: |
           cd openwrt
-          # 用项目里的 config 覆盖，再 make defconfig 自动补全依赖
           cp -f $GITHUB_WORKSPACE/$CONFIG_FILE .config
           make defconfig
           echo "===== 最终 .config 摘要 ====="
-          grep -E '^(CONFIG_TARGET|CONFIG_PACKAGE_luci-app|CONFIG_PACKAGE_(passwall|openclash|mihomo|xray|sing-box|v2ray|trojan|shadowsocks))' .config | head -60
+          grep -E '^(CONFIG_TARGET|CONFIG_PACKAGE_luci-app)' .config | head -60
 
       - name: SSH 调试 (可选)
         uses: mxschmitt/action-tmate@v3
@@ -108,7 +104,6 @@ jobs:
           set -o pipefail
           cd openwrt
           make download -j$(nproc)
-          # 检查是否有下载失败的小文件
           find dl -size -1024c -exec ls -l {} \; 2>/dev/null || true
 
       - name: 编译固件
@@ -119,58 +114,58 @@ jobs:
           echo "===== 开始编译，多线程 ====="
           make -j$(nproc) V=s 2>&1 | tee build.log
           echo "===== make world 完成，开始生成固件镜像 ====="
-          # 多profile并行编译时 make world 可能跳过 target/linux/install
-          # 显式执行确保固件镜像(.bin)生成
           make target/linux/install -j$(nproc) V=s 2>&1 | tee -a build.log
           echo "===== 固件镜像生成完成 ====="
-          echo "--- bin/targets/ramips/mt7621/ 内容 ---"
           ls -lh bin/targets/ramips/mt7621/ 2>/dev/null || echo "目录不存在"
-          echo "--- 所有 .bin 文件 ---"
           find bin/targets/ -name '*.bin' -ls 2>/dev/null || true
 
       - name: 整理固件产物
+        id: organize
         if: env.UPLOAD_FIRMWARE == 'true'
         run: |
           cd openwrt
           mkdir -p /tmp/firmware
-          # 复制 sysupgrade / factory 固件
           find bin/targets/ramips/mt7621/ -type f \( -name '*sysupgrade.bin' -o -name '*factory.bin' -o -name '*kernel1.bin' -o -name '*rootfs0.bin' -o -name 'sha256sums' -o -name '*.manifest' \) -exec cp -f {} /tmp/firmware/ \; 2>/dev/null || true
-          # 复制关键 ipk (passwall/openclash 等)
           find bin/packages/mipsel_24kc/base/ -type f -name '*.ipk' \( -name '*passwall*' -o -name '*openclash*' -o -name '*mihomo*' -o -name '*xray*' -o -name '*sing-box*' -o -name '*v2ray*' -o -name '*trojan*' -o -name '*shadowsocks*' \) -exec cp -f {} /tmp/firmware/ \; 2>/dev/null || true
           find bin/packages/mipsel_24kc/luci/ -type f -name '*.ipk' \( -name '*passwall*' -o -name '*openclash*' \) -exec cp -f {} /tmp/firmware/ \; 2>/dev/null || true
-          # fallback: 查找所有 .bin 文件
           find bin/targets/ramips/mt7621/ -type f -name '*.bin' -exec cp -f {} /tmp/firmware/ \; 2>/dev/null || true
           cd /tmp/firmware
-          # 统计 .bin 文件数量
           BIN_COUNT=$(find /tmp/firmware/ -name '*.bin' 2>/dev/null | wc -l)
           echo "找到 $BIN_COUNT 个 .bin 固件文件"
           if [ "$BIN_COUNT" -gt 0 ]; then
             sha256sum * > sha256sums.txt
             ls -lh /tmp/firmware/
           else
-            echo "⚠️ 没有找到 .bin 固件文件！诊断信息："
-            echo "--- bin/targets/ramips/mt7621/ 内容 ---"
-            ls -lhR bin/targets/ramips/mt7621/ 2>/dev/null || echo "目录不存在"
-            echo "--- bin/ 下所有 .bin ---"
-            find bin/ -name '*.bin' -ls 2>/dev/null | head -20
+            echo "没有找到 .bin 固件文件"
+            find $GITHUB_WORKSPACE -path '*bin/targets*' -name '*.bin' 2>/dev/null | head -20
             exit 1
           fi
+          mkdir -p $GITHUB_WORKSPACE/firmware
+          cp -f /tmp/firmware/* $GITHUB_WORKSPACE/firmware/
+          echo "FILE_DATE=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+          echo status=success >> $GITHUB_OUTPUT
 
       - name: 上传固件 artifact
-        if: env.UPLOAD_FIRMWARE == 'true'
+        if: steps.organize.outputs.status == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-ac2100-${{ github.run_number }}
-          path: /tmp/firmware/*
-          retention-days: 14
+          path: firmware/*
+          retention-days: 30
           compression-level: 0
 
-      - name: 删除旧 workflow 运行记录
-        if: github.event_name == 'schedule'
-        uses: Mattraks/delete-workflow-runs@v2
+      - name: 发布固件到 Release
+        if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
         with:
-          retain_days: 7
-          keep_minimum_runs: 5
+          tag_name: ac2100-${{ github.run_number }}
+          name: ImmortalWrt AC2100 #${{ github.run_number }}
+          body: |
+            ImmortalWrt 24.10 / ramips mt7621 / 小米 红米 AC2100
+            集成 passwall2 + OpenClash (mihomo)
+            sysupgrade.bin 用于从 OpenWrt 升级，factory.bin 用于从官方固件刷入
+            刷机有变砖风险，请先备份原固件
+          files: firmware/*
 
       - name: 总是上传编译日志
         if: always()
@@ -178,5 +173,5 @@ jobs:
         with:
           name: build-log-${{ github.run_number }}
           path: openwrt/build.log
-          retention-days: 7
+          retention-days: 14
           if-no-files-found: ignore
